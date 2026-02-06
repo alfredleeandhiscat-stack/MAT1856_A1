@@ -1,0 +1,566 @@
+---
+title: "MAT1856 A1"
+author: "Shuaiyu Li"
+date: "2026-01-17"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preparations
+```{r, message=F}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+```
+
+
+# 2.1 Q2)
+
+## selecting the 10 bonds
+
+```{r}
+# Load the master dataset:
+bonds <- read_csv("bonds_master_all.csv", show_col_types = FALSE)
+
+# The Chosen 10 Bonds:
+chosen_isins <- c(
+  "CA135087R978", # CAN 4 Aug 26
+  "CA135087S547", # CAN 3 Feb 27
+  "CA135087T461", # CAN 2.5 Aug 27
+  "CA135087T958", # CAN 2.25 Feb 28
+  "CA135087Q491", # CAN 3.25 Sep 28
+  "CA135087Q988", # CAN 4 Mar 29
+  "CA135087R895", # CAN 3.5 Sep 29
+  "CA135087S471", # CAN 2.75 Mar 30
+  "CA135087T388", # CAN 2.75 Sep 30
+  "CA135087T792"  # CAN 2.75 Mar 31
+)
+
+# Build the assignmnt label from Coupon + Maturity Date
+make_can_label <- function(coupon_str, maturity_str) {
+  coupon_num <- as.numeric(str_remove(coupon_str, "%"))         
+  mat <- mdy(maturity_str)                                      
+  paste0("CAN ", coupon_num, " ", format(mat, "%b %y"))          
+}
+```
+
+## Build the Chosen bonds'dataset:
+```{r}
+# The dataset
+bonds_10 <- bonds %>%
+  filter(ISIN %in% chosen_isins) %>%
+  mutate(
+    date = ymd(date),
+    maturity_date = mdy(`Maturity Date`),
+    issue_date = mdy(`Issue Date`),
+    can_label = make_can_label(Coupon, `Maturity Date`)
+  ) %>%
+  arrange(maturity_date, date)
+
+# A quick Check
+bonds_10 %>%
+  distinct(ISIN, can_label, Coupon, `Issue Date`, `Maturity Date`, `Issue Volume`) %>%
+  arrange(mdy(`Maturity Date`)) %>%
+  print(n = Inf)
+```
+
+# 2.2 Q4a)
+```{r}
+# 1) Helpers: build coupon schedule & compute YTM by solving PV(y)=Price
+
+# Generate coupon payment dates (semi-annual) from maturity backwards
+coupon_schedule <- function(settle, maturity, freq = 2) {
+  step_months <- 12 / freq
+
+  # generate coupon dates backwards from maturity
+  d <- seq(from = maturity,
+           to   = settle - days(1),   # ensure we include the first coupon after settle
+           by   = paste0("-", step_months, " months"))
+
+  d <- sort(as.Date(d))
+  d[d > settle]   # keep only future payment dates
+}
+
+
+# Present value given yield y (APR with compounding freq), using ACT/365 for times
+bond_pv <- function(y, price_per_100, coupon_rate, settle, maturity, freq = 2, face = 100) {
+  pay_dates <- coupon_schedule(settle, maturity, freq = freq)
+  pay_dates <- pay_dates[pay_dates > settle]  # cashflows strictly after settlement
+
+  if (length(pay_dates) == 0) return(NA_real_)
+
+  # year fractions (ACT/365) from settle to each payment date
+  t <- as.numeric(pay_dates - settle) / 365.0
+
+  cpn <- (coupon_rate/100) * face / freq
+  cashflows <- rep(cpn, length(pay_dates))
+  cashflows[length(cashflows)] <- cashflows[length(cashflows)] + face
+
+  disc <- (1 + y/freq) ^ (-freq * t)
+  sum(cashflows * disc)
+}
+
+# Solve for YTM with uniroot
+ytm_from_price <- function(price_pct, coupon_rate, settle, maturity, freq = 2) {
+  price <- price_pct # price in "per 100 par" units since it's % of par
+  # if already matured or bad price
+  if (is.na(price) || price <= 0 || maturity <= settle) return(NA_real_)
+
+  f <- function(y) bond_pv(y, price, coupon_rate, settle, maturity, freq = freq) - price
+
+  # Bracket yields (allow slightly negative; expand if needed)
+  lower <- -0.05
+  upper <-  0.30
+
+  # If function doesn't change sign, try expanding once
+  fl <- f(lower); fu <- f(upper)
+  if (is.na(fl) || is.na(fu)) return(NA_real_)
+  if (fl * fu > 0) {
+    lower2 <- -0.20
+    upper2 <-  0.80
+    fl2 <- f(lower2); fu2 <- f(upper2)
+    if (is.na(fl2) || is.na(fu2) || fl2 * fu2 > 0) return(NA_real_)
+    lower <- lower2; upper <- upper2
+  }
+
+  uniroot(f, lower = lower, upper = upper, tol = 1e-10)$root
+}
+
+```
+
+```{r}
+# 2) Compute YTM for each (date, bond)
+
+ytm_daily <- bonds_10 %>%
+  mutate(
+    date = ymd(date),
+    maturity_date = mdy(`Maturity Date`),
+    coupon_rate = as.numeric(str_remove(Coupon, "%")),
+    price_pct = `Close Price (% of par)`,
+    ttm_years = as.numeric(maturity_date - date) / 365.0,
+    can_label = make_can_label(Coupon, `Maturity Date`)
+  ) %>%
+  group_by(date, ISIN) %>%
+  summarise(
+    can_label = first(can_label),
+    coupon_rate = first(coupon_rate),
+    maturity_date = first(maturity_date),
+    ttm_years = first(ttm_years),
+    price_pct = first(price_pct),
+    ytm = ytm_from_price(first(price_pct), first(coupon_rate), first(date), first(maturity_date), freq = 2),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(ytm), ttm_years > 0, ttm_years <= 6)  # keep a bit beyond 5y for stable interpolation
+
+# Quick check: see computed yields
+ytm_daily %>% arrange(date, ttm_years) %>% print(n = 30)
+```
+
+```{r}
+
+# 3) Build 5-year yield curve for each day via Piecewise Linear Interpolation
+
+grid_years <- seq(0.25, 5.00, by = 0.25)
+
+curve_daily <- ytm_daily %>%
+  group_by(date) %>%
+  group_modify(~{
+    d <- .x %>% arrange(ttm_years)
+    # Need at least 2 points to interpolate
+    if (nrow(d) < 2) return(tibble())
+
+    f <- approxfun(d$ttm_years, d$ytm, method = "linear", rule = 2)
+
+    tibble(
+      ttm_years = grid_years,
+      ytm = f(grid_years)
+    )
+  }) %>%
+  ungroup()
+
+```
+
+## Graph Altogether
+
+```{r}
+# 4) Plot: 5-year yield curve for each day, superimposed
+ggplot(curve_daily, aes(
+  x = ttm_years,
+  y = ytm,
+  colour = as.factor(date),
+  group = date
+)) +
+  geom_line(size = 1) +
+  labs(
+    title = "5-Year Yield Curve (YTM) — Daily Curves Superimposed",
+    x = "Time to Maturity (years)",
+    y = "Yield to Maturity (annual, compounded semi-annually)",
+    colour = "Date"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 9)
+  )
+```
+
+# 2.2 Q4 b)
+
+```{r}
+# Step 1 - helpers
+ yearfrac_act365 <- function(start_date, end_date) {
+  as.numeric(end_date - start_date) / 365.0
+}
+
+bond_cashflows <- function(settle, maturity, coupon_rate, freq = 2, face = 100) {
+  pay_dates <- coupon_schedule(settle, maturity, freq = freq)
+  pay_dates <- pay_dates[pay_dates > settle]  # only future CFs
+
+  cpn <- (coupon_rate/100) * face / freq
+  cf  <- rep(cpn, length(pay_dates))
+  cf[length(cf)] <- cf[length(cf)] + face
+
+  tibble(
+    pay_date = pay_dates,
+    t = yearfrac_act365(settle, pay_dates),
+    cf = cf
+  )
+}
+
+```
+
+```{r}
+# Step 2 - prepare per date cashflow + prices
+
+bond_panels <- bonds_10 %>%
+  mutate(
+    coupon_rate   = as.numeric(str_remove(Coupon, "%")),
+    maturity_date = mdy(`Maturity Date`),
+    price         = `Close Price (% of par)`  # per 100 par
+  ) %>%
+  select(date, ISIN, coupon_rate, maturity_date, price)
+
+# Keep ALL bonds up to 5Y
+bond_panels_1to5 <- bond_panels %>%
+  mutate(ttm = as.numeric(maturity_date - date) / 365) %>%
+  filter(ttm > 0, ttm <= 5)
+```
+
+```{r}
+# Step 3 — bootstrap function for 1 day
+bootstrap_spot_one_day <- function(day_df, freq = 2, face = 100) {
+
+  settle <- unique(day_df$date)
+  stopifnot(length(settle) == 1)
+
+  # Build CF tables, sort by maturity
+  cf_list <- day_df %>%
+    mutate(cf_tbl = purrr::pmap(
+      list(maturity_date, coupon_rate),
+      ~ bond_cashflows(settle, ..1, ..2, freq = freq, face = face)
+    )) %>%
+    select(ISIN, price, maturity_date, cf_tbl) %>%
+    arrange(maturity_date)
+
+  known_t <- numeric(0)
+  known_D <- numeric(0)
+
+  # log-linear interpolation of D(t) for t within known range,
+  # and a "power" extrapolation for t < min(known_t) using the first known D
+  D_interp <- function(t) {
+    if (length(known_t) == 0) return(rep(NA_real_, length(t)))
+
+    # only one point known: assume flat continuously in log(D) between 0 and T1
+    if (length(known_t) == 1) {
+      return(known_D[1]^(t / known_t[1]))
+    }
+
+    t <- as.numeric(t)
+
+    # within range: log-linear
+    f_in <- approxfun(known_t, log(known_D), method = "linear", rule = 1)
+    D_out <- exp(f_in(pmin(pmax(t, min(known_t)), max(known_t))))
+
+    # below min known: power extrapolation from first point
+    idx_lo <- which(t < min(known_t))
+    if (length(idx_lo) > 0) {
+      D_out[idx_lo] <- known_D[1]^(t[idx_lo] / known_t[1])
+    }
+
+    # above max known: allow linear extrap on log(D)
+    idx_hi <- which(t > max(known_t))
+    if (length(idx_hi) > 0) {
+      f_hi <- approxfun(known_t, log(known_D), method = "linear", rule = 2)
+      D_out[idx_hi] <- exp(f_hi(t[idx_hi]))
+    }
+
+    D_out
+  }
+
+  for (k in seq_len(nrow(cf_list))) {
+
+    price_k <- cf_list$price[[k]]
+    cfs_k   <- cf_list$cf_tbl[[k]]
+
+    T <- max(cfs_k$t)  # maturity time (in years)
+
+    cf_T <- cfs_k %>%
+      filter(t == T) %>%
+      summarise(cf = sum(cf)) %>%
+      pull(cf)
+
+    earlier <- cfs_k %>% filter(t < T)
+
+    pv_earlier <- 0
+    if (nrow(earlier) > 0) {
+      D_earlier <- D_interp(earlier$t)
+      if (all(is.na(D_earlier))) {
+        pv_earlier <- NA_real_
+      } else {
+        pv_earlier <- sum(earlier$cf * D_earlier)
+      }
+    }
+
+    # If pv_earlier is NA (edge case), treat as zero-coupon approx for first step
+    if (is.na(pv_earlier)) pv_earlier <- 0
+
+    # Solve for the maturity discount factor
+    D_T <- (price_k - pv_earlier) / cf_T
+
+    known_t <- c(known_t, T)
+    known_D <- c(known_D, D_T)
+  }
+
+  out <- tibble(t = known_t, D = known_D) %>%
+    arrange(t) %>%
+    mutate(
+      spot = 2 * (D^(-1/(2*t)) - 1)   # semi-annual compounded spot rate
+    )
+
+  out
+}
+```
+
+```{r}
+# Step 4 — run bootstrap for ALL days, then interpolate spot onto 1–5y grid
+grid_1_5 <- seq(1.00, 5.00, by = 0.25)
+
+spot_daily_raw <- bond_panels_1to5 %>%
+  group_by(date) %>%
+  group_modify(~ bootstrap_spot_one_day(.x, freq = 2, face = 100), .keep = TRUE) %>%
+  ungroup()
+
+spot_daily_curve <- spot_daily_raw %>%
+  group_by(date) %>%
+  group_modify(~{
+    d <- .x %>% arrange(t)
+    f <- approxfun(d$t, d$spot, method = "linear", rule = 2)
+    tibble(t = grid_1_5, spot = f(grid_1_5))
+  }) %>%
+  ungroup()
+```
+
+```{r}
+# Step 5 — plot
+ggplot(spot_daily_curve,
+       aes(x = t, y = spot, colour = as.factor(date), group = date)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title  = "1–5 Year Spot (Zero) Curves — Daily Curves Superimposed",
+    x      = "Maturity (years)",
+    y      = "Spot rate (annual, semi-annual compounding)",
+    colour = "Date"
+  ) +
+  theme_minimal()
+```
+
+# 2.2 Q4 c)
+```{r}
+# Step 1 — extract the spot rates
+spot_int <- spot_daily_curve %>%
+  filter(t %in% 1:5) %>%
+  select(date, t, spot)
+
+```
+
+```{r}
+# Step 2 — compute 1-year forwards starting at 1 year
+fwd_T <- 2:5  # keep your same choice
+
+forward_daily_curve <- spot_int %>%
+  filter(t == 1) %>%
+  rename(S1 = spot) %>%
+  select(date, S1) %>%
+  inner_join(
+    spot_int %>% filter(t %in% fwd_T) %>% rename(T = t, ST = spot),
+    by = "date"
+  ) %>%
+  mutate(
+    n = T - 1,
+    # discount factors from semiannual-compounded spot rates
+    D1 = (1 + S1/2)^(-2 * 1),
+    DT = (1 + ST/2)^(-2 * T),
+    # 1-year forward rate from year 1 to year T (APR, semiannual comp)
+    fwd_1yr = 2 * ((D1/DT)^(1/(2*n)) - 1)
+  ) %>%
+  arrange(date, T)
+```
+
+```{r}
+# Step 3 — plot
+
+ggplot(forward_daily_curve,
+       aes(x = T, y = fwd_1yr, colour = as.factor(date), group = date)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "1-Year Forward Rates Starting in 1 Year (from Bootstrapped Spot Curve)",
+    x = "Forward end date T (years)",
+    y = "Forward rate f(1,T) (APR, semi-annual compounding)",
+    colour = "Date"
+  ) +
+  theme_minimal()
+```
+
+# 2.2 Q5
+
+```{r}
+# sanity check
+sort(unique(curve_daily$date))
+sort(unique(forward_daily_curve$date))
+```
+
+```{r}
+# Step 1 — Build the 1y–5y yield table 
+yields_1to5 <- curve_daily %>%
+  filter(ttm_years %in% 1:5) %>%
+  mutate(mat = paste0("y", as.integer(ttm_years))) %>%
+  select(date, mat, ytm) %>%
+  pivot_wider(names_from = mat, values_from = ytm) %>%
+  arrange(date)
+
+yields_1to5
+```
+```{r}
+# Step 2 — Compute daily log-returns for those 5 yields
+yield_ret <- yields_1to5 %>%
+  mutate(across(starts_with("y"), ~ log(.x / dplyr::lag(.x)))) %>%
+  filter(!is.na(y1))   # drop first row (no lag)
+
+yield_ret
+
+# Covariance matrix for yield log-returns
+yield_cov <- cov(yield_ret %>% select(y1, y2, y3, y4, y5))
+yield_cov
+
+```
+
+```{r}
+# Step 4 — Build the forward rate table (levels)
+fwd_1to4 <- forward_daily_curve %>%
+  filter(T %in% 2:5) %>%
+  mutate(fwd = paste0("f", T-1)) %>%   # f1,f2,f3,f4 correspond to 1-1,...,1-4
+  select(date, fwd, fwd_1yr) %>%
+  pivot_wider(names_from = fwd, values_from = fwd_1yr) %>%
+  arrange(date)
+
+fwd_1to4
+
+```
+
+```{r}
+# Step 5 — Compute daily log-returns for the 4 forward rates
+fwd_ret <- fwd_1to4 %>%
+  mutate(across(starts_with("f"), ~ log(.x / dplyr::lag(.x)))) %>%
+  filter(!is.na(f1))
+
+fwd_ret
+
+```
+
+```{r}
+# Covariance matrix for forward-rate log-returns
+fwd_cov <- cov(fwd_ret %>% select(f1, f2, f3, f4))
+colnames(yield_cov) <- rownames(yield_cov) <- c("1Y","2Y","3Y","4Y","5Y")
+colnames(fwd_cov)   <- rownames(fwd_cov)   <- c("1y-1y","1y-2y","1y-3y","1y-4y")
+
+yield_cov
+fwd_cov
+```
+
+# 2.2 Q6
+
+```{r}
+# Step 1: eigen-decomposition
+eig_yield <- eigen(yield_cov)
+eig_fwd   <- eigen(fwd_cov)
+
+```
+
+```{r}
+# Step 2: eigenvalue tables + variance explained
+yield_eigs <- tibble(
+  component = paste0("PC", seq_along(eig_yield$values)),
+  eigenvalue = eig_yield$values,
+  var_explained = eig_yield$values / sum(eig_yield$values)
+)
+
+fwd_eigs <- tibble(
+  component = paste0("PC", seq_along(eig_fwd$values)),
+  eigenvalue = eig_fwd$values,
+  var_explained = eig_fwd$values / sum(eig_fwd$values)
+)
+
+yield_eigs
+fwd_eigs
+
+```
+
+```{r}
+# Step 3: eigenvector (loading) matrices with labels
+yield_loadings <- as.data.frame(eig_yield$vectors)
+colnames(yield_loadings) <- paste0("PC", seq_len(ncol(yield_loadings)))
+yield_loadings$maturity <- rownames(yield_cov)
+yield_loadings <- yield_loadings %>% relocate(maturity)
+
+fwd_loadings <- as.data.frame(eig_fwd$vectors)
+colnames(fwd_loadings) <- paste0("PC", seq_len(ncol(fwd_loadings)))
+fwd_loadings$tenor <- rownames(fwd_cov)
+fwd_loadings <- fwd_loadings %>% relocate(tenor)
+
+yield_loadings
+fwd_loadings
+```
+
+```{r}
+# Step 4: first eigenpair (largest eigenvalue = PC1)
+lambda1_yield <- eig_yield$values[1]
+v1_yield <- eig_yield$vectors[, 1]
+names(v1_yield) <- rownames(yield_cov)
+
+lambda1_fwd <- eig_fwd$values[1]
+v1_fwd <- eig_fwd$vectors[, 1]
+names(v1_fwd) <- rownames(fwd_cov)
+
+lambda1_yield
+v1_yield
+
+lambda1_fwd
+v1_fwd
+
+# normalization
+v1_yield_norm <- v1_yield / sum(abs(v1_yield))
+v1_fwd_norm   <- v1_fwd   / sum(abs(v1_fwd))
+
+v1_yield_norm
+v1_fwd_norm
+
+```
+
